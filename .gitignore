@@ -1,0 +1,20 @@
+
+# Editor
+.vscode/
+.vs/
+
+# Build output
+build/
+out/
+CMakeFiles/
+CMakeCache.txt
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+
+# Private notes
+LBM Theory Companion.pdf
+PLAN.md
+runs/
