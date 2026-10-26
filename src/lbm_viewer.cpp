@@ -1,8 +1,9 @@
 // lbm.cpp — D2Q9 lattice Boltzmann (BGK), flow past a cylinder, live Win32 window.
 //
 // Build:  g++ -O3 -march=native -fopenmp src/lbm_viewer.cpp -o lbm_viewer.exe -lgdi32
-// Keys:   Space = pause   V = vorticity/speed view   R = reset
-// Mouse:  left-drag = draw wall   right-drag = erase wall
+// Keys:   Space = pause   V = vorticity/speed view   R = reset   C = cylinder/channel case
+//         K = velocity rake on/off   A = exact Poiseuille profile on the rake (channel case)
+// Mouse:  left-drag = draw wall   right-drag = erase wall   shift+left-drag = place rake
 //
 // Units are lattice units: dx = dt = 1, c_s^2 = 1/3.
 // Everything below maps to 4 equations:
@@ -73,7 +74,19 @@ bool inShape(int x, int y) {
     return std::abs(dx) <= 1 && std::abs(dy) <= CYL_R;
 }
 
+void setupChannel(int H, float umax);
+bool channelCase = false;             // which case reset() builds: cylinder (default) or Poiseuille channel
+constexpr float CHANNEL_TAU = 1.0f;   // channel viscosity nu = 1/6: develops in ~1 min at H = 98
+
 void reset() {
+    if (channelCase) {
+        setViscosity((CHANNEL_TAU - 0.5f) / 3.0f);
+        setupChannel(NY - 2, U0);
+        return;
+    }
+    PERIODIC_X = false;
+    FX = FY = 0.0f;
+    setViscosity(U0 * 2 * CYL_R / RE);
     for (int y = 0; y < NY; y++)
         for (int x = 0; x < NX; x++) {
             //int dx = x - CYL_X, dy = y - CYL_Y;
@@ -89,7 +102,10 @@ void reset() {
 // driven by a uniform body force. With halfway bounce-back the walls sit at y = 0.5 and y = H + 0.5,
 // and the exact steady profile is u(y) = FX / (2 nu) * (y - 0.5) * (H + 0.5 - y)  (rho = 1).
 // FX is chosen so the centerline speed is umax.
+int CHANNEL_H = 0;
+
 void setupChannel(int H, float umax) {
+    CHANNEL_H = H;
     PERIODIC_X = true;
     FX = 8.0f * NU * umax / (float(H) * H);  // u_max = F H^2 / (8 nu)
     FY = 0.0f;
@@ -100,6 +116,23 @@ void setupChannel(int H, float umax) {
             ux[idx(x, y)] = uy[idx(x, y)] = 0.0f;  // start at rest, let the force spin it up
             for (int i = 0; i < 9; i++) f[fidx(i, x, y)] = feq(i, 1.0f, 0.0f, 0.0f);
         }
+}
+
+// exact channel profile at (continuous) height y; zero outside the walls
+double channelExactU(double y) {
+    if (y < 0.5 || y > CHANNEL_H + 0.5) return 0.0;
+    return FX / (2.0 * NU) * (y - 0.5) * (CHANNEL_H + 0.5 - y);
+}
+
+// relative L2 error of column x against the exact profile: sqrt(sum (u - u_exact)^2 / sum u_exact^2)
+double channelProfileError(int x) {
+    double e = 0, n = 0;
+    for (int y = 1; y <= CHANNEL_H; y++) {
+        double ue = channelExactU(y), u = ux[idx(x, y)];
+        e += (u - ue) * (u - ue);
+        n += ue * ue;
+    }
+    return std::sqrt(e / n);
 }
 
 void step() {
@@ -190,6 +223,100 @@ void render() {
         }
 }
 
+// ---------------- velocity rake ----------------
+// A probe line in lattice coordinates (node centers at integers). Along it u is sampled by bilinear
+// interpolation and drawn as arrows, their tips joined into a profile curve. Optionally the exact
+// Poiseuille profile is drawn at the same probes (channel case only).
+// Everything goes out in one PolyPolyline per pen: GDI cost is per call, so ~150 arrows take ~0.1 ms.
+bool showRake = false, showExact = false, rakeDragging = false;
+float rakeX0 = NX / 2, rakeY0 = 0, rakeX1 = NX / 2, rakeY1 = NY - 1;
+constexpr float RAKE_SPACING = 3.0f;    // lattice cells between probes
+constexpr float ARROW_PX = 30.0f / U0;  // screen pixels per unit lattice velocity: U0 -> 30 px
+
+// solid nodes count as u = 0 (walls don't move)
+void sampleU(float x, float y, float& u, float& v) {
+    x = std::fmin(std::fmax(x, 0.0f), NX - 1.001f);
+    y = std::fmin(std::fmax(y, 0.0f), NY - 1.001f);
+    int x0 = (int)x, y0 = (int)y;
+    float tx = x - x0, ty = y - y0;
+    u = v = 0;
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+            int n = idx(x0 + i, y0 + j);
+            if (solid[n]) continue;
+            float wgt = (i ? tx : 1 - tx) * (j ? ty : 1 - ty);
+            u += wgt * ux[n];
+            v += wgt * uy[n];
+        }
+}
+
+POINT toScreen(float x, float y) { return {LONG((x + 0.5f) * SCALE), LONG((NY - 0.5f - y) * SCALE)}; }
+
+void toLattice(LPARAM lp, float& x, float& y) {
+    x = std::fmin(std::fmax((short)LOWORD(lp) / float(SCALE) - 0.5f, 0.0f), NX - 1.0f);
+    y = std::fmin(std::fmax(NY - 0.5f - (short)HIWORD(lp) / float(SCALE), 0.0f), NY - 1.0f);
+}
+
+// polylines for PolyPolyline: points plus a count per run
+struct Runs {
+    std::vector<POINT> pts;
+    std::vector<DWORD> counts;
+    bool broken = true;
+    void clear() { pts.clear(); counts.clear(); broken = true; }
+    void add(POINT p) {
+        if (broken) counts.push_back(0);
+        pts.push_back(p);
+        counts.back()++;
+        broken = false;
+    }
+    void cut() {  // end the current run; PolyPolyline needs >= 2 points per run
+        if (!broken && counts.back() == 1) { pts.push_back(pts.back()); counts.back() = 2; }
+        broken = true;
+    }
+    void draw(HDC dc) { cut(); if (!counts.empty()) PolyPolyline(dc, pts.data(), counts.data(), (DWORD)counts.size()); }
+};
+
+void drawRake(HDC dc) {
+    static HPEN linePen = CreatePen(PS_DOT, 1, RGB(90, 90, 90));
+    static HPEN simPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+    static HPEN exactPen = CreatePen(PS_SOLID, 3, RGB(0, 170, 0));
+    static Runs arrows, profile, exact;
+    arrows.clear(); profile.clear(); exact.clear();
+    bool withExact = showExact && channelCase;
+
+    float dx = rakeX1 - rakeX0, dy = rakeY1 - rakeY0;
+    int n = (int)(std::sqrt(dx * dx + dy * dy) / RAKE_SPACING + 0.5f);
+    if (n < 1) n = 1;
+    for (int k = 0; k <= n; k++) {
+        float x = rakeX0 + dx * k / n, y = rakeY0 + dy * k / n;
+        if (solid[idx((int)(x + 0.5f), (int)(y + 0.5f))]) { profile.cut(); exact.cut(); continue; }
+        float u, v;
+        sampleU(x, y, u, v);
+        POINT base = toScreen(x, y), tip = {LONG(base.x + u * ARROW_PX), LONG(base.y - v * ARROW_PX)};
+        profile.add(tip);
+        if (withExact) exact.add({LONG(base.x + channelExactU(y) * ARROW_PX), base.y});
+
+        float ax = float(tip.x - base.x), ay = float(tip.y - base.y), len = std::sqrt(ax * ax + ay * ay);
+        if (len < 2) continue;
+        float h = std::fmin(5.0f, 0.4f * len) / len, c = 0.906f, s = 0.423f;  // head: +-25 degrees
+        POINT left = {LONG(tip.x - h * (c * ax - s * ay)), LONG(tip.y - h * (s * ax + c * ay))};
+        POINT right = {LONG(tip.x - h * (c * ax + s * ay)), LONG(tip.y - h * (-s * ax + c * ay))};
+        for (POINT p : {base, tip, left, tip, right}) arrows.add(p);  // one run per arrow, retracing the tip
+        arrows.cut();
+    }
+
+    HGDIOBJ old = SelectObject(dc, linePen);
+    POINT a = toScreen(rakeX0, rakeY0), b = toScreen(rakeX1, rakeY1);
+    MoveToEx(dc, a.x, a.y, nullptr);
+    LineTo(dc, b.x, b.y);
+    SelectObject(dc, exactPen);  // under the measured curve, so a match shows as black on green
+    exact.draw(dc);
+    SelectObject(dc, simPen);
+    arrows.draw(dc);
+    profile.draw(dc);
+    SelectObject(dc, old);
+}
+
 // ---------------- window / input ----------------
 void paint(HWND hwnd) {
     BITMAPINFO bmi = {};
@@ -201,6 +328,7 @@ void paint(HWND hwnd) {
     bmi.bmiHeader.biCompression = BI_RGB;
     HDC dc = GetDC(hwnd);
     StretchDIBits(dc, 0, 0, NX * SCALE, NY * SCALE, 0, 0, NX, NY, pixels, &bmi, DIB_RGB_COLORS, SRCCOPY);
+    if (showRake) drawRake(dc);  // straight on top: ~0.1 ms, vs ~0.6 ms for a back buffer every frame
     ReleaseDC(hwnd, dc);
 }
 
@@ -225,10 +353,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_SPACE) paused = !paused;
         if (wp == 'V') showVorticity = !showVorticity;
         if (wp == 'R') reset();
+        if (wp == 'C') {
+            channelCase = !channelCase;
+            reset();
+            std::printf("%s  nu=%.4f  tau=%.4f\n", channelCase ? "Poiseuille channel" : "cylinder", NU, TAU);
+        }
+        if (wp == 'K') showRake = !showRake;
+        if (wp == 'A') { showExact = !showExact; if (showExact) showRake = true; }
         return 0;
-    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN:
+        if (wp & MK_SHIFT) {  // shift-drag places the rake
+            toLattice(lp, rakeX0, rakeY0);
+            rakeX1 = rakeX0; rakeY1 = rakeY0;
+            rakeDragging = showRake = true;
+            SetCapture(hwnd);
+            return 0;
+        }
+        [[fallthrough]];
+    case WM_RBUTTONDOWN: case WM_MOUSEMOVE:
+        if (rakeDragging) { toLattice(lp, rakeX1, rakeY1); return 0; }
         if (wp & MK_LBUTTON) brush(lp, true);
         else if (wp & MK_RBUTTON) brush(lp, false);
+        return 0;
+    case WM_LBUTTONUP:
+        if (rakeDragging) { rakeDragging = false; ReleaseCapture(); }
         return 0;
     }
     return DefWindowProc(hwnd, msg, wp, lp);
@@ -276,9 +424,14 @@ int main() {
         DWORD now = GetTickCount();
         if (now - lastTitle >= 500) {
             double mlups = stepsSinceTitle * double(NX * NY) / ((now - lastTitle) * 1e3);
-            char title[160];
-            std::snprintf(title, sizeof title, "LBM  step %lld  |  %.1f MLUPS  |  %s%s", t, mlups,
-                          showVorticity ? "vorticity" : "speed", paused ? "  [PAUSED]" : "");
+            char title[200], err[64] = "";
+            if (channelCase && showRake && showExact) {  // nodal error in the column under the rake's middle
+                int col = (int)((rakeX0 + rakeX1) / 2 + 0.5f);
+                std::snprintf(err, sizeof err, "  |  L2 vs exact (x=%d) %.2e", col, channelProfileError(col));
+            }
+            std::snprintf(title, sizeof title, "LBM  step %lld  |  %.1f MLUPS  |  %s  |  %s%s%s", t, mlups,
+                          channelCase ? "channel" : "cylinder", showVorticity ? "vorticity" : "speed", err,
+                          paused ? "  [PAUSED]" : "");
             SetWindowTextA(hwnd, title);
             lastTitle = now;
             stepsSinceTitle = 0;

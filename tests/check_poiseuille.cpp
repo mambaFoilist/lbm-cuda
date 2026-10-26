@@ -27,8 +27,6 @@ const float UMAX = 0.1f;  // centerline speed, same Mach number as the cylinder 
 
 struct Result { double err; long long steps; bool converged; };
 
-double exactU(int H, float y) { return FX / (2.0 * NU) * (y - 0.5) * (H + 0.5 - y); }
-
 Result runChannel(int H, float tau, bool printProfile = false) {
     setViscosity((tau - 0.5f) / 3.0f);
     setupChannel(H, UMAX);
@@ -51,15 +49,11 @@ Result runChannel(int H, float tau, bool printProfile = false) {
         if (std::isnan(n)) break;
         if (std::sqrt(d / n) < 1e-7) { res.converged = true; break; }
     }
-    double e = 0, n = 0;
-    if (printProfile) std::printf("     y    u_sim       u_exact\n");
-    for (int y = 1; y <= H; y++) {
-        double ue = exactU(H, y), u = ux[idx(X, y)];
-        e += (u - ue) * (u - ue);
-        n += ue * ue;
-        if (printProfile) std::printf("  %4d  %.7f  %.7f\n", y, u, ue);
+    if (printProfile) {
+        std::printf("     y    u_sim       u_exact\n");
+        for (int y = 1; y <= H; y++) std::printf("  %4d  %.7f  %.7f\n", y, ux[idx(X, y)], channelExactU(y));
     }
-    res.err = std::sqrt(e / n);
+    res.err = channelProfileError(X);
     return res;
 }
 
