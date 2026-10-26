@@ -18,3 +18,15 @@ This serves as an entertainment of my interests in statistical mechanics, comput
 - OpenGL representation of GPU runs
 
 As with is the general course for  LBM solvers, I am keeping it within a fairly incompressible regime. Ma < 0.3 (Ma ~ 0.17) for stable flow so that the propogation of our pressure doesnt have to worry about the flow catching up with it. Also, error will scale with Ma^2.
+
+## Validation
+
+My validation takes 3 pieces. 
+
+### Poiseiulle Flow
+
+Given how difficult NS can be, we look for simple analytic solutions to verify the behavior of our solver. Assume we have an long unobstructed pipe of fluid that has reached steady state flow. I highly recommend Brian Storey's video on this. His walkthrough is very clear and concise. He doesn't know me or anything just thought he made a great video :P. 
+
+[Brian Storey's Video](https://www.youtube.com/watch?v=zsp6ZNB62mc)
+
+For a similar setup, we expect to get back a parabolic velocity profile. That is precisely what check_poiseuille.cpp does. It required an extra forcing term to replicate the -dp/dx (i.e. the constant pressure gradient in the direction of the pipe) but it does replicate it pretty faithfully.
