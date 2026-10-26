@@ -26,9 +26,18 @@ constexpr float U0 = 0.1f;            // inlet speed (Ma = U0/c_s ~ 0.17, keep <
 constexpr float RE = 100.0f;          // Reynolds number based on cylinder diameter
 constexpr int CYL_X = NX / 5, CYL_Y = NY / 2 + 2, CYL_R = NY / 9;  // +2 offset breaks symmetry -> shedding
 
-const float NU = U0 * 2 * CYL_R / RE;   // Re = U D / nu  ->  nu = U D / Re
-const float TAU = 3.0f * NU + 0.5f;     // nu = (tau - 1/2)/3  ->  tau. Must stay > 0.5
-const float OMEGA = 1.0f / TAU;
+// Not const so other cases (e.g. the Poiseuille check) can pick their own viscosity via setViscosity().
+float NU = U0 * 2 * CYL_R / RE;   // Re = U D / nu  ->  nu = U D / Re
+float TAU = 3.0f * NU + 0.5f;     // nu = (tau - 1/2)/3  ->  tau. Must stay > 0.5
+float OMEGA = 1.0f / TAU;
+
+void setViscosity(float nu) { NU = nu; TAU = 3.0f * nu + 0.5f; OMEGA = 1.0f / TAU; }
+
+// Optional extras, both off for the cylinder:
+//   body force density (FX, FY), added with Guo's scheme in the collision
+//   PERIODIC_X: left/right edges wrap around instead of inlet/outlet
+float FX = 0.0f, FY = 0.0f;
+bool PERIODIC_X = false;
 
 // ---------------- D2Q9 lattice ----------------
 //   6 2 5
@@ -67,7 +76,7 @@ bool inShape(int x, int y) {
 void reset() {
     for (int y = 0; y < NY; y++)
         for (int x = 0; x < NX; x++) {
-            int dx = x - CYL_X, dy = y - CYL_Y;
+            //int dx = x - CYL_X, dy = y - CYL_Y;
             solid[idx(x, y)] = inShape(x,y);
             rho[idx(x, y)] = 1.0f;
             ux[idx(x, y)] = solid[idx(x, y)] ? 0.0f : U0;
@@ -76,8 +85,29 @@ void reset() {
         }
 }
 
+// Channel for the Poiseuille check: fluid rows y = 1..H, solid at y = 0 and y > H, periodic in x,
+// driven by a uniform body force. With halfway bounce-back the walls sit at y = 0.5 and y = H + 0.5,
+// and the exact steady profile is u(y) = FX / (2 nu) * (y - 0.5) * (H + 0.5 - y)  (rho = 1).
+// FX is chosen so the centerline speed is umax.
+void setupChannel(int H, float umax) {
+    PERIODIC_X = true;
+    FX = 8.0f * NU * umax / (float(H) * H);  // u_max = F H^2 / (8 nu)
+    FY = 0.0f;
+    for (int y = 0; y < NY; y++)
+        for (int x = 0; x < NX; x++) {
+            solid[idx(x, y)] = (y == 0 || y > H);
+            rho[idx(x, y)] = 1.0f;
+            ux[idx(x, y)] = uy[idx(x, y)] = 0.0f;  // start at rest, let the force spin it up
+            for (int i = 0; i < 9; i++) f[fidx(i, x, y)] = feq(i, 1.0f, 0.0f, 0.0f);
+        }
+}
+
 void step() {
+    const bool forced = FX != 0.0f || FY != 0.0f;  // unforced path stays exactly the plain BGK update
+
     // 1-3: compute moments, then BGK collision (in place)
+    //   With a force (Guo et al. 2002): u = (sum f_i c_i + F/2) / rho, and after relaxing add
+    //   S_i = (1 - omega/2) w_i [3 (c_i - u).F + 9 (c_i.u)(c_i.F)]. Keeps the scheme second order.
 #pragma omp parallel for
     for (int y = 0; y < NY; y++)
         for (int x = 0; x < NX; x++) {
@@ -90,23 +120,29 @@ void step() {
                 my += fi * cy[i];
             }
             float u = mx / r, v = my / r;
+            if (forced) { u += 0.5f * FX / r; v += 0.5f * FY / r; }
             rho[idx(x, y)] = r; ux[idx(x, y)] = u; uy[idx(x, y)] = v;
             for (int i = 0; i < 9; i++) {
                 float& fi = f[fidx(i, x, y)];
                 fi += OMEGA * (feq(i, r, u, v) - fi);
+                if (forced) {
+                    float cF = cx[i] * FX + cy[i] * FY, cu = cx[i] * u + cy[i] * v;
+                    fi += (1.0f - 0.5f * OMEGA) * w[i] * (3.0f * (cF - u * FX - v * FY) + 9.0f * cu * cF);
+                }
             }
         }
 
     // 4: streaming ("pull": each node grabs what arrives from x - c_i).
     //    If the source is a wall, the population that left toward the wall
     //    bounces back: f_i(x) = f_opp(i)(x)  -> no-slip wall (halfway bounce-back).
-    //    Top/bottom are periodic.
+    //    Top/bottom are periodic; left/right too if PERIODIC_X.
 #pragma omp parallel for
     for (int y = 0; y < NY; y++)
         for (int x = 0; x < NX; x++) {
             if (solid[idx(x, y)]) continue;
             for (int i = 0; i < 9; i++) {
                 int xs = x - cx[i];
+                if (PERIODIC_X) xs = (xs + NX) % NX;
                 int ys = (y - cy[i] + NY) % NY;
                 if (xs < 0 || xs >= NX)        f2[fidx(i, x, y)] = f[fidx(i, x, y)];  // fixed by BCs below
                 else if (solid[idx(xs, ys)])   f2[fidx(i, x, y)] = f[fidx(opp[i], x, y)];
@@ -115,6 +151,7 @@ void step() {
         }
 
     // boundaries: inlet = equilibrium at (rho=1, u=U0); outlet = zero-gradient copy
+    if (!PERIODIC_X)
     for (int y = 0; y < NY; y++)
         for (int i = 0; i < 9; i++) {
             f2[fidx(i, 0, y)] = feq(i, 1.0f, U0, 0.0f);
