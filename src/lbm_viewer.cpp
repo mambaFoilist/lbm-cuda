@@ -52,11 +52,23 @@ inline float feq(int i, float r, float u, float v) {
     return w[i] * r * (1.0f + cu + 0.5f * cu * cu - 1.5f * (u * u + v * v));
 }
 
+bool inShape(int x, int y) {
+    float dx = x - CYL_X, dy = y - CYL_Y;
+
+    // Circle
+    //return dx*dx + dy*dy <= CYL_R*CYL_R;
+
+    // Square:      return std::abs(dx) <= CYL_R && std::abs(dy) <= CYL_R;
+    // Ellipse:     return (dx*dx)/(2.0f*CYL_R*CYL_R) + (dy*dy)/(0.5f*CYL_R*CYL_R) <= 1.0f;
+    //Flat plate:  
+    return std::abs(dx) <= 1 && std::abs(dy) <= CYL_R;
+}
+
 void reset() {
     for (int y = 0; y < NY; y++)
         for (int x = 0; x < NX; x++) {
             int dx = x - CYL_X, dy = y - CYL_Y;
-            solid[idx(x, y)] = (dx * dx + dy * dy <= CYL_R * CYL_R);
+            solid[idx(x, y)] = inShape(x,y);
             rho[idx(x, y)] = 1.0f;
             ux[idx(x, y)] = solid[idx(x, y)] ? 0.0f : U0;
             uy[idx(x, y)] = 0.0f;
