@@ -4,8 +4,9 @@
 // zKeys:   Space = pause   V = vorticity/speed view   R = reset   C = cylinder/channel case
 //         K = velocity rake on/off   A = exact Poiseuille profile on the rake (channel case)
 //         S = streamlines on/off     X = clear streamline seeds (back to auto seeds at the inlet)
+//         D = population panel (f_i, f_i^eq, f_i^neq at one node)   N = single step while paused
 // Mouse:  left-drag = draw wall   right-drag = erase wall   shift+left-drag = place rake
-//         ctrl+click = add streamline seed
+//         ctrl+click = add streamline seed   middle-click/drag = pick the panel's node
 //
 // Units are lattice units: dx = dt = 1, c_s^2 = 1/3.
 // Everything below maps to 4 equations:
@@ -17,8 +18,10 @@
 
 #include <windows.h>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cwchar>
 #include <vector>
 
 // ---------------- simulation parameters ----------------
@@ -405,6 +408,148 @@ void drawStreamlines(HDC dc) {
     SelectObject(dc, old);
 }
 
+// ---------------- population panel ----------------
+// One node's 9 populations laid out like the lattice (direction i sits where c_i points), each next
+// to its equilibrium and f^neq = f - f^eq. f is read between steps: after streaming, before the next
+// collision, i.e. what just arrived at the node. rho and u are recomputed from those f exactly as the
+// collision will (the rho/ux/uy arrays are a step older: set by the last collision, before streaming).
+// The collision then takes f^neq -> (1 - omega) f^neq (+ Guo source): the bars show f^neq before
+// (dark) and after (light) it, on one scale per node. With tau < 1 (the cylinder) omega > 1 and BGK
+// over-relaxes: f jumps past f^eq and f^neq flips sign. Streaming rebuilds f^neq from the gradients.
+// Chapman-Enskog: sum f^neq c c = -2 rho c_s^2 tau S, so f^neq carries the strain rate S locally.
+// The panel goes into a small bitmap every few frames (numbers changing at 60 Hz can't be read
+// anyway) and is BitBlt'd onto the window each frame: one call.
+bool showDist = false, stepOnce = false;
+int distX = CYL_X + 2 * CYL_R, distY = CYL_Y + CYL_R / 2;  // default: in the near wake
+constexpr int PANEL_EVERY = 6;  // frames between redraws of the panel bitmap
+int panelAge = PANEL_EVERY;     // set to PANEL_EVERY to force a redraw on the next frame
+constexpr int CELL_W = 138, CELL_H = 62, PANEL_W = 3 * CELL_W + 8, PANEL_H = 3 * CELL_H + 84;
+
+// populations at node (x, y) as the next collision sees them. In double, so f - f^eq isn't swamped
+// by float rounding of f^eq (f itself is stored in float: |f^neq| below ~1e-8 is noise).
+struct NodePops { double f[9], eq[9], neq[9], post[9], r, u, v; };
+
+NodePops nodePops(int x, int y) {
+    NodePops p;
+    p.r = p.u = p.v = 0;
+    for (int i = 0; i < 9; i++) {
+        p.f[i] = f[fidx(i, x, y)];
+        p.r += p.f[i]; p.u += p.f[i] * cx[i]; p.v += p.f[i] * cy[i];
+    }
+    p.u = (p.u + 0.5 * FX) / p.r; p.v = (p.v + 0.5 * FY) / p.r;  // as in step(): Guo's half-force shift
+    for (int i = 0; i < 9; i++) {
+        double cu = cx[i] * p.u + cy[i] * p.v, cF = cx[i] * FX + cy[i] * FY;
+        p.eq[i] = w[i] * p.r * (1 + 3 * cu + 4.5 * cu * cu - 1.5 * (p.u * p.u + p.v * p.v));
+        p.neq[i] = p.f[i] - p.eq[i];
+        double src = (1 - 0.5 * OMEGA) * w[i] * (3 * (cF - p.u * FX - p.v * FY) + 9 * cu * cF);
+        p.post[i] = (1 - OMEGA) * p.neq[i] + src;  // f* - f^eq after the collision
+    }
+    return p;
+}
+
+void textf(HDC dc, int x, int y, const wchar_t* fmt, ...) {
+    wchar_t s[160];
+    va_list a;
+    va_start(a, fmt);
+    int n = vswprintf(s, 160, fmt, a);
+    va_end(a);
+    if (n > 0) TextOutW(dc, x, y, s, n);
+}
+
+void drawPanel(HDC dc) {  // into the panel bitmap, origin at its top-left
+    static HFONT font = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                    CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+    static HBRUSH bg = CreateSolidBrush(RGB(250, 250, 250)), edge = CreateSolidBrush(RGB(150, 150, 150));
+    static HBRUSH posPre = CreateSolidBrush(RGB(210, 30, 30)), posPost = CreateSolidBrush(RGB(245, 165, 165));
+    static HBRUSH negPre = CreateSolidBrush(RGB(30, 60, 210)), negPost = CreateSolidBrush(RGB(165, 180, 245));
+    RECT all = {0, 0, PANEL_W, PANEL_H};
+    FillRect(dc, &all, bg);
+    FrameRect(dc, &all, edge);
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(0, 0, 0));
+    if (solid[idx(distX, distY)]) {
+        textf(dc, 6, 4, L"node (%d, %d) is solid: no populations live here", distX, distY);
+        SelectObject(dc, oldFont);
+        return;
+    }
+    NodePops p = nodePops(distX, distY);
+    textf(dc, 6, 4, L"node (%d, %d)  ρ = %.6f  u = (%+.5f, %+.5f)", distX, distY, p.r, p.u, p.v);
+    textf(dc, 6, 18, L"τ = %.4f  ω = %.4f  collide: fneq → %+.3f fneq%ls",
+          TAU, OMEGA, 1.0 - OMEGA, FX != 0 || FY != 0 ? L" + src" : L"");
+
+    double scale = 1e-30;  // largest |f^neq| before or after: full bar width
+    for (int i = 0; i < 9; i++) scale = std::fmax(scale, std::fmax(std::fabs(p.neq[i]), std::fabs(p.post[i])));
+    for (int i = 0; i < 9; i++) {
+        int x0 = 4 + (cx[i] + 1) * CELL_W, y0 = 34 + (1 - cy[i]) * CELL_H;
+        RECT cell = {x0, y0, x0 + CELL_W + 1, y0 + CELL_H + 1};
+        FrameRect(dc, &cell, edge);
+        SetTextColor(dc, RGB(120, 120, 120));
+        textf(dc, x0 + CELL_W - 28, y0 + 3, L"i=%d", i);
+        SetTextColor(dc, RGB(0, 0, 0));
+        textf(dc, x0 + 5, y0 + 3, L"f   %.7f", p.f[i]);
+        textf(dc, x0 + 5, y0 + 16, L"eq  %.7f", p.eq[i]);
+        textf(dc, x0 + 5, y0 + 29, L"neq %+.3e", p.neq[i]);
+        int mid = x0 + CELL_W / 2, half = CELL_W / 2 - 8;  // bars grow right for f^neq > 0, left for < 0
+        auto bar = [&](double v, int y, HBRUSH pos, HBRUSH neg) {
+            int len = (int)(half * v / scale + (v > 0 ? 0.5 : -0.5));
+            RECT r = {len < 0 ? mid + len : mid, y, (len > 0 ? mid + len : mid) + 1, y + 5};
+            FillRect(dc, &r, v > 0 ? pos : neg);
+        };
+        bar(p.neq[i], y0 + 46, posPre, negPre);
+        bar(p.post[i], y0 + 53, posPost, negPost);
+    }
+
+    // moments of f^neq: mass and momentum are what the collision conserves, so these are ~0 and -F/2
+    double m0 = 0, mx = 0, my = 0, pxy = 0;
+    for (int i = 0; i < 9; i++) {
+        m0 += p.neq[i]; mx += p.neq[i] * cx[i]; my += p.neq[i] * cy[i];
+        pxy += p.neq[i] * cx[i] * cy[i];
+    }
+    int y = 34 + 3 * CELL_H + 4;
+    textf(dc, 6, y, L"Σ fneq = %+.1e   Σ fneq c = (%+.1e, %+.1e) = -F/2", m0, mx, my);
+    // S_xy two ways: locally from f^neq (S = -3 Pi^neq / (2 rho tau)), and by central differences of u
+    // (u arrays from the last collision; skipped next to walls, where the stencil would cross one)
+    double sFneq = -3.0 * pxy / (2.0 * p.r * TAU);
+    int xl = distX - 1, xr = distX + 1, yd = (distY - 1 + NY) % NY, yu = (distY + 1) % NY;
+    if (PERIODIC_X) { xl = (xl + NX) % NX; xr = xr % NX; }
+    bool fdOk = xl >= 0 && xr < NX && !solid[idx(xl, distY)] && !solid[idx(xr, distY)] &&
+                !solid[idx(distX, yd)] && !solid[idx(distX, yu)];
+    wchar_t fd[40] = L"n/a (wall)", ex[40] = L"";
+    if (fdOk)
+        swprintf(fd, 40, L"%+.3e", 0.25 * ((ux[idx(distX, yu)] - ux[idx(distX, yd)]) + (uy[idx(xr, distY)] - uy[idx(xl, distY)])));
+    if (channelCase)  // S_xy = (1/2) du/dy of the exact profile
+        swprintf(ex, 40, L"  exact %+.3e", FX / (4.0 * NU) * (CHANNEL_H + 1 - 2.0 * distY));
+    textf(dc, 6, y + 14, L"S_xy: fneq %+.3e  ∇u %ls%ls", sFneq, fd, ex);
+    textf(dc, 6, y + 28, L"bars: fneq before/after collision (dark/light), full %.1e", scale);
+    SelectObject(dc, oldFont);
+}
+
+void drawDist(HDC dc) {
+    static HDC mdc = nullptr;
+    static HPEN markPen = CreatePen(PS_SOLID, 2, RGB(255, 140, 0));
+    if (!mdc) {
+        mdc = CreateCompatibleDC(dc);
+        SelectObject(mdc, CreateCompatibleBitmap(dc, PANEL_W, PANEL_H));
+    }
+    if (++panelAge >= PANEL_EVERY) { panelAge = 0; drawPanel(mdc); }
+    int px = distX < NX / 2 ? NX * SCALE - PANEL_W - 4 : 4;  // opposite half from the node: never covers it
+    BitBlt(dc, px, 4, PANEL_W, PANEL_H, mdc, 0, 0, SRCCOPY);
+    POINT c = toScreen(distX, distY), box[5] = {{c.x - 4, c.y - 4}, {c.x + 4, c.y - 4}, {c.x + 4, c.y + 4},
+                                                 {c.x - 4, c.y + 4}, {c.x - 4, c.y - 4}};
+    HGDIOBJ old = SelectObject(dc, markPen);
+    Polyline(dc, box, 5);
+    SelectObject(dc, old);
+}
+
+void pickNode(LPARAM lp) {
+    float x, y;
+    toLattice(lp, x, y);
+    distX = (int)(x + 0.5f); distY = (int)(y + 0.5f);
+    showDist = true;
+    panelAge = PANEL_EVERY;
+}
+
 // ---------------- window / input ----------------
 void paint(HWND hwnd) {
     BITMAPINFO bmi = {};
@@ -419,6 +564,7 @@ void paint(HWND hwnd) {
     // overlays go straight on top: ~0.1 ms, vs ~0.6 ms for a back buffer every frame
     if (showStreamlines) drawStreamlines(dc);
     if (showRake) drawRake(dc);
+    if (showDist) drawDist(dc);
     ReleaseDC(hwnd, dc);
 }
 
@@ -442,17 +588,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (wp == VK_SPACE) paused = !paused;
         if (wp == 'V') showVorticity = !showVorticity;
-        if (wp == 'R') { reset(); streamAge = RETRACE_EVERY; }
+        if (wp == 'R') { reset(); streamAge = RETRACE_EVERY; panelAge = PANEL_EVERY; }
         if (wp == 'C') {
             channelCase = !channelCase;
             reset();
             streamAge = RETRACE_EVERY;
+            panelAge = PANEL_EVERY;
             std::printf("%s  nu=%.4f  tau=%.4f\n", channelCase ? "Poiseuille channel" : "cylinder", NU, TAU);
         }
         if (wp == 'K') showRake = !showRake;
         if (wp == 'A') { showExact = !showExact; if (showExact) showRake = true; }
         if (wp == 'S') { showStreamlines = !showStreamlines; streamAge = RETRACE_EVERY; }
         if (wp == 'X') { seedX.clear(); seedY.clear(); streamAge = RETRACE_EVERY; }  // back to auto seeds
+        if (wp == 'D') { showDist = !showDist; panelAge = PANEL_EVERY; }
+        if (wp == 'N' && paused) { stepOnce = true; panelAge = PANEL_EVERY; }  // one step: watch f relax
         return 0;
     case WM_LBUTTONDOWN:
         if (wp & MK_CONTROL) {  // ctrl+click adds a streamline seed
@@ -478,6 +627,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp & MK_CONTROL) return 0;  // moving after a ctrl+click shouldn't paint walls
         if (wp & MK_LBUTTON) brush(lp, true);
         else if (wp & MK_RBUTTON) brush(lp, false);
+        else if (wp & MK_MBUTTON) pickNode(lp);  // middle-drag moves the panel's node
+        return 0;
+    case WM_MBUTTONDOWN:
+        pickNode(lp);
         return 0;
     case WM_LBUTTONUP:
         if (rakeDragging) { rakeDragging = false; ReleaseCapture(); }
@@ -512,10 +665,12 @@ int main() {
             TranslateMessage(&m);
             DispatchMessage(&m);
         }
-        if (!paused) {
-            for (int s = 0; s < STEPS_PER_FRAME; s++) step();
-            t += STEPS_PER_FRAME;
-            stepsSinceTitle += STEPS_PER_FRAME;
+        if (!paused || stepOnce) {
+            int n = paused ? 1 : STEPS_PER_FRAME;  // N while paused: a single step
+            stepOnce = false;
+            for (int s = 0; s < n; s++) step();
+            t += n;
+            stepsSinceTitle += n;
             if (std::isnan(rho[idx(NX / 2, NY / 2)])) {
                 std::printf("Diverged at step %lld (NaN). Resetting.\n", t);
                 reset();
