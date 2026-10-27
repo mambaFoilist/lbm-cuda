@@ -23,7 +23,9 @@
 
 const real UMAX = 0.1;  // centerline speed, same Mach number as the cylinder case
 
-struct Result { double err; long long steps; bool converged; };
+// forceErr: steady state means the walls hold back exactly what the body force pushes, so the
+// momentum-exchange force on the walls must equal F_body * (number of fluid nodes) = fx * H here.
+struct Result { double err, forceErr; long long steps; bool converged; };
 
 Result runChannel(int H, real tau, bool printProfile = false) {
     Lattice L(1, H + 2);
@@ -34,7 +36,7 @@ Result runChannel(int H, real tau, bool printProfile = false) {
     // like exp(-nu pi^2 t / H^2), so cap at ~50 of those time constants.
     const long long maxSteps = (long long)(50.0 * H * H / (L.nu * 9.87)) + 10 * CHECK;
     std::vector<double> prev(H + 1, 0.0);
-    Result res = {0, 0, false};
+    Result res = {0, 0, 0, false};
     for (res.steps = 1; res.steps <= maxSteps; res.steps++) {
         L.step();
         if (res.steps % CHECK) continue;
@@ -53,6 +55,9 @@ Result runChannel(int H, real tau, bool printProfile = false) {
         for (int y = 1; y <= H; y++) std::printf("  %4d  %.7f  %.7f\n", y, L.ux[L.idx(0, y)], poiseuilleU(L, H, y));
     }
     res.err = poiseuilleError(L, H, 0);
+    Force Fw = L.wallForce();  // the loop always stops right after a step(), as wallForce needs
+    double Fbody = L.fx * H;
+    res.forceErr = std::sqrt((Fw.x - Fbody) * (Fw.x - Fbody) + Fw.y * Fw.y) / Fbody;
     return res;
 }
 
@@ -60,21 +65,23 @@ int main(int argc, char** argv) {
     bool verbose = argc > 1 && std::strcmp(argv[1], "-v") == 0;
     auto t0 = std::chrono::steady_clock::now();
     bool okConv = true;
+    double forceErrMax = 0;
 
     // ---- grid refinement at tau = 1 ----
     const int Hs[] = {4, 8, 16, 32, 64};
     const int NH = sizeof Hs / sizeof Hs[0];
     double err[NH], order[NH] = {};
     std::printf("Refinement, tau = 1.0, u_max = %.2f\n", UMAX);
-    std::printf("     H    steps    L2 error    order\n");
+    std::printf("     H    steps    L2 error   wall force vs body force    order\n");
     for (int k = 0; k < NH; k++) {
         Result r = runChannel(Hs[k], 1.0, verbose && Hs[k] == 16);
         err[k] = r.err;
         okConv &= r.converged;
-        std::printf("  %4d  %7lld   %.3e", Hs[k], r.steps, r.err);
+        forceErrMax = std::fmax(forceErrMax, r.forceErr);
+        std::printf("  %4d  %7lld   %.3e   %.1e", Hs[k], r.steps, r.err, r.forceErr);
         if (k > 0) {
             order[k] = std::log(err[k - 1] / err[k]) / std::log(double(Hs[k]) / Hs[k - 1]);
-            std::printf("    %.3f", order[k]);
+            std::printf("                    %.3f", order[k]);
         }
         std::printf("%s\n", r.converged ? "" : "  NOT CONVERGED");
     }
@@ -86,17 +93,20 @@ int main(int argc, char** argv) {
     std::printf("\nMagic tau = %.4f (exact for BGK + bounce-back), error = round-off floor\n", TAU_MAGIC);
     Result m8 = runChannel(8, TAU_MAGIC), m32 = runChannel(32, TAU_MAGIC);
     okConv &= m8.converged && m32.converged;
+    forceErrMax = std::fmax(forceErrMax, std::fmax(m8.forceErr, m32.forceErr));
     std::printf("  H =  8   L2 error %.3e\n  H = 32   L2 error %.3e\n", m8.err, m32.err);
 
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     bool okOrder = ordMin > 1.95 && ordMax < 2.05;
     bool okErr = err[2] < 2e-3;                    // H = 16, tau = 1 (measured 1.78e-3)
     bool okMagic = m8.err < 1e-9 && m32.err < 1e-9; // a forcing or wall bug gives ~1e-2
+    bool okForce = forceErrMax < 1e-9;              // momentum balance: wall force = body force
 
     std::printf("\n(%.1f s)\n", secs);
     std::printf("[%s] all runs reached steady state\n", okConv ? "PASS" : "FAIL");
     std::printf("[%s] convergence order in [%.3f, %.3f] over H = 4..64, expect 2\n", okOrder ? "PASS" : "FAIL", ordMin, ordMax);
     std::printf("[%s] L2 error at H=16 = %.3e (expect < 2e-3)\n", okErr ? "PASS" : "FAIL", err[2]);
     std::printf("[%s] magic-tau error at H=8, 32 = %.1e, %.1e (expect < 1e-9)\n", okMagic ? "PASS" : "FAIL", m8.err, m32.err);
-    return (okConv && okOrder && okErr && okMagic) ? 0 : 1;
+    std::printf("[%s] wall force = body force, worst relative mismatch %.1e (expect < 1e-9)\n", okForce ? "PASS" : "FAIL", forceErrMax);
+    return (okConv && okOrder && okErr && okMagic && okForce) ? 0 : 1;
 }

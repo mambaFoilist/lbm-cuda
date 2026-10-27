@@ -9,7 +9,7 @@ This serves as an entertainment of my interests in statistical mechanics, comput
 - Drawing Method to represent a test run
 - A stable looking test run on cylinder
 
-![Bluff cylinder developing a Von Karman Street](image-1.png)
+![Bluff cylinder developing a Von Karman Street](docs\VonKarmanStreet.png)
 
 ## Next Steps
 - Validate what I am currently getting against:
@@ -35,4 +35,4 @@ For a similar setup, we expect to get back a parabolic velocity profile. That is
 
 For my viewer, I added the option to visually watch the flow converge to what we expect.
 
-![Screenshot of Poiseuille Flow Validation](image.png)
+![Screenshot of Poiseuille Flow Validation](PoiseuilleFlow.png)

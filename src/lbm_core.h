@@ -35,6 +35,8 @@ inline real feq(int i, real r, real u, real v) {
 }
 
 // ---------------- lattice ----------------
+struct Force { real x, y; };
+
 struct Lattice {
     int nx, ny;
     std::vector<real> f, f2;          // populations (two buffers for streaming)
@@ -124,6 +126,33 @@ struct Lattice {
 
         f.swap(f2);
     }
+
+    // Force of the fluid on the solid nodes picked by onBody(x, y), by momentum exchange (Ladd 1994).
+    // A population f*_i (post-collision) at fluid node x heading into solid at x + c_i comes back as
+    // f_opp(i): its momentum flips from f*_i c_i to -f*_i c_i, so the wall receives 2 f*_i c_i.
+    // F = sum over all such links of 2 f*_i c_i  (stationary walls).
+    // Call right after step(): the swap leaves that step's post-collision populations in f2.
+    template <class Pred>
+    Force wallForce(Pred onBody) const {
+        real sx = 0, sy = 0;
+#pragma omp parallel for reduction(+ : sx, sy) if (nx * ny > 4096)
+        for (int y = 0; y < ny; y++)
+            for (int x = 0; x < nx; x++) {
+                if (solid[idx(x, y)]) continue;
+                for (int i = 1; i < 9; i++) {
+                    int xn = x + cx[i];
+                    if (periodicX) xn = (xn + nx) % nx;
+                    else if (xn < 0 || xn >= nx) continue;
+                    int yn = (y + cy[i] + ny) % ny;
+                    if (!solid[idx(xn, yn)] || !onBody(xn, yn)) continue;
+                    real fi = f2[fidx(i, x, y)];
+                    sx += 2 * fi * cx[i];
+                    sy += 2 * fi * cy[i];
+                }
+            }
+        return {sx, sy};
+    }
+    Force wallForce() const { return wallForce([](int, int) { return true; }); }  // on every solid node
 };
 
 // ---------------- cases ----------------
