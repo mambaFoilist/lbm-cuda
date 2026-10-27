@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
 
     // Staircase bounce-back makes the cylinder slightly the wrong shape and size, so C_D is off by an
     // amount that shrinks with N. Measured at tau = 0.65 when this test was written:
-    //   N = 10: +17.1%   N = 20: +5.3%
+    //   N = 10: +17.1%   N = 20: +5.3%   N = 40: +1.5%
     // That error vs N IS the convergence study (research question 2), so this only guards against
     // regressions at N >= 20. C_L is tiny (1/500 of C_D, set by the 0.005 offset of the cylinder from
     // the channel middle) and more sensitive to the staircase: reported, not asserted.
