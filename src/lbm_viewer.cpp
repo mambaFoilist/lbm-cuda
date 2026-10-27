@@ -1,20 +1,14 @@
-// lbm.cpp — D2Q9 lattice Boltzmann (BGK), flow past a cylinder, live Win32 window.
+// lbm_viewer.cpp — live Win32 window on top of the solver core (lbm_core.h).
 //
 // Build:  g++ -O3 -march=native -fopenmp src/lbm_viewer.cpp -o lbm_viewer.exe -lgdi32
-// zKeys:   Space = pause   V = vorticity/speed view   R = reset   C = cylinder/channel case
+// Keys:   Space = pause   V = vorticity/speed view   R = reset   C = cylinder/channel case
 //         K = velocity rake on/off   A = exact Poiseuille profile on the rake (channel case)
 //         S = streamlines on/off     X = clear streamline seeds (back to auto seeds at the inlet)
 //         D = population panel (f_i, f_i^eq, f_i^neq at one node)   N = single step while paused
 // Mouse:  left-drag = draw wall   right-drag = erase wall   shift+left-drag = place rake
 //         ctrl+click = add streamline seed   middle-click/drag = pick the panel's node
 //
-// Units are lattice units: dx = dt = 1, c_s^2 = 1/3.
-// Everything below maps to 4 equations:
-//   1. moments:      rho = sum f_i,   rho*u = sum f_i * c_i
-//   2. equilibrium:  f_i^eq = w_i rho (1 + 3 c.u + 4.5 (c.u)^2 - 1.5 u.u)
-//   3. collide:      f_i <- f_i - (f_i - f_i^eq) / tau
-//   4. stream:       f_i(x + c_i, t+1) = f_i(x, t)
-// Chapman-Enskog shows this recovers Navier-Stokes with nu = c_s^2 (tau - 1/2), p = c_s^2 rho.
+// The physics (equations, collision, streaming, boundaries, the two cases) lives in lbm_core.h.
 
 #include <windows.h>
 #include <cmath>
@@ -24,48 +18,32 @@
 #include <cwchar>
 #include <vector>
 
+#include "lbm_core.h"
+
 // ---------------- simulation parameters ----------------
 constexpr int NX = 400, NY = 100;     // lattice size
 constexpr int SCALE = 3;              // screen pixels per lattice cell
 constexpr int STEPS_PER_FRAME = 20;
 constexpr float U0 = 0.1f;            // inlet speed (Ma = U0/c_s ~ 0.17, keep < ~0.3)
 constexpr float RE = 100.0f;          // Reynolds number based on cylinder diameter
-constexpr int CYL_X = NX / 5, CYL_Y = NY / 2 + 2, CYL_R = NY / 9;  // +2 offset breaks symmetry -> shedding
+constexpr int CYL_X = NX / 5, CYL_Y = NY / 2, CYL_R = NY / 9;  // shedding is started by kickWake in reset()
 
-// Not const so other cases (e.g. the Poiseuille check) can pick their own viscosity via setViscosity().
-float NU = U0 * 2 * CYL_R / RE;   // Re = U D / nu  ->  nu = U D / Re
-float TAU = 3.0f * NU + 0.5f;     // nu = (tau - 1/2)/3  ->  tau. Must stay > 0.5
-float OMEGA = 1.0f / TAU;
-
-void setViscosity(float nu) { NU = nu; TAU = 3.0f * nu + 0.5f; OMEGA = 1.0f / TAU; }
-
-// Optional extras, both off for the cylinder:
-//   body force density (FX, FY), added with Guo's scheme in the collision
-//   PERIODIC_X: left/right edges wrap around instead of inlet/outlet
-float FX = 0.0f, FY = 0.0f;
-bool PERIODIC_X = false;
-
-// ---------------- D2Q9 lattice ----------------
-//   6 2 5
-//   3 0 1
-//   7 4 8
-const int cx[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1};
-const int cy[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
-const float w[9] = {4.f / 9, 1.f / 9, 1.f / 9, 1.f / 9, 1.f / 9, 1.f / 36, 1.f / 36, 1.f / 36, 1.f / 36};
-const int opp[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};  // direction pointing the other way
-
-// ---------------- fields ----------------
-std::vector<float> f(9 * NX * NY), f2(9 * NX * NY);  // populations (two buffers for streaming)
-std::vector<float> rho(NX * NY), ux(NX * NY), uy(NX * NY);
-std::vector<uint8_t> solid(NX * NY);
+// The lattice, plus short names for its fields so the drawing code below reads like the math.
+Lattice L(NX, NY);
+std::vector<real>& f = L.f;
+std::vector<real>& rho = L.rho;
+std::vector<real>& ux = L.ux;
+std::vector<real>& uy = L.uy;
+std::vector<uint8_t>& solid = L.solid;
+real& NU = L.nu;
+real& TAU = L.tau;
+real& OMEGA = L.omega;
+real& FX = L.fx;
+real& FY = L.fy;
+bool& PERIODIC_X = L.periodicX;
 
 inline int idx(int x, int y) { return y * NX + x; }
 inline int fidx(int i, int x, int y) { return (i * NY + y) * NX + x; }
-
-inline float feq(int i, float r, float u, float v) {
-    float cu = 3.0f * (cx[i] * u + cy[i] * v);
-    return w[i] * r * (1.0f + cu + 0.5f * cu * cu - 1.5f * (u * u + v * v));
-}
 
 bool inShape(int x, int y) {
     float dx = x - CYL_X, dy = y - CYL_Y;
@@ -75,129 +53,30 @@ bool inShape(int x, int y) {
 
     // Square:      return std::abs(dx) <= CYL_R && std::abs(dy) <= CYL_R;
     // Ellipse:     return (dx*dx)/(2.0f*CYL_R*CYL_R) + (dy*dy)/(0.5f*CYL_R*CYL_R) <= 1.0f;
-    //Flat plate:  
+    //Flat plate:
     //return std::abs(dx) <= 1 && std::abs(dy) <= CYL_R;
 }
 
-void setupChannel(int H, float umax);
 bool channelCase = false;             // which case reset() builds: cylinder (default) or Poiseuille channel
 constexpr float CHANNEL_TAU = 1.0f;   // channel viscosity nu = 1/6: develops in ~1 min at H = 98
+int CHANNEL_H = 0;
 
 void reset() {
     if (channelCase) {
-        setViscosity((CHANNEL_TAU - 0.5f) / 3.0f);
-        setupChannel(NY - 2, U0);
+        L.setViscosity((CHANNEL_TAU - 0.5f) / 3.0f);
+        CHANNEL_H = NY - 2;
+        setupChannel(L, CHANNEL_H, U0);
         return;
     }
-    PERIODIC_X = false;
-    FX = FY = 0.0f;
-    setViscosity(U0 * 2 * CYL_R / RE);
-    for (int y = 0; y < NY; y++)
-        for (int x = 0; x < NX; x++) {
-            //int dx = x - CYL_X, dy = y - CYL_Y;
-            solid[idx(x, y)] = inShape(x,y);
-            rho[idx(x, y)] = 1.0f;
-            ux[idx(x, y)] = solid[idx(x, y)] ? 0.0f : U0;
-            uy[idx(x, y)] = 0.0f;
-            for (int i = 0; i < 9; i++) f[fidx(i, x, y)] = feq(i, 1.0f, ux[idx(x, y)], 0.0f);
-        }
+    L.setViscosity(U0 * 2 * CYL_R / RE);  // Re = U D / nu  ->  nu = U D / Re
+    setupFlowPast(L, U0, inShape);
+    kickWake(L, CYL_X + CYL_R, CYL_Y, CYL_R, 0.1f * U0);  // break the symmetry so it sheds right away
 }
 
-// Channel for the Poiseuille check: fluid rows y = 1..H, solid at y = 0 and y > H, periodic in x,
-// driven by a uniform body force. With halfway bounce-back the walls sit at y = 0.5 and y = H + 0.5,
-// and the exact steady profile is u(y) = FX / (2 nu) * (y - 0.5) * (H + 0.5 - y)  (rho = 1).
-// FX is chosen so the centerline speed is umax.
-int CHANNEL_H = 0;
+double channelExactU(double y) { return poiseuilleU(L, CHANNEL_H, y); }
+double channelProfileError(int x) { return poiseuilleError(L, CHANNEL_H, x); }
+void step() { L.step(); }
 
-void setupChannel(int H, float umax) {
-    CHANNEL_H = H;
-    PERIODIC_X = true;
-    FX = 8.0f * NU * umax / (float(H) * H);  // u_max = F H^2 / (8 nu)
-    FY = 0.0f;
-    for (int y = 0; y < NY; y++)
-        for (int x = 0; x < NX; x++) {
-            solid[idx(x, y)] = (y == 0 || y > H);
-            rho[idx(x, y)] = 1.0f;
-            ux[idx(x, y)] = uy[idx(x, y)] = 0.0f;  // start at rest, let the force spin it up
-            for (int i = 0; i < 9; i++) f[fidx(i, x, y)] = feq(i, 1.0f, 0.0f, 0.0f);
-        }
-}
-
-// exact channel profile at (continuous) height y; zero outside the walls
-double channelExactU(double y) {
-    if (y < 0.5 || y > CHANNEL_H + 0.5) return 0.0;
-    return FX / (2.0 * NU) * (y - 0.5) * (CHANNEL_H + 0.5 - y);
-}
-
-// relative L2 error of column x against the exact profile: sqrt(sum (u - u_exact)^2 / sum u_exact^2)
-double channelProfileError(int x) {
-    double e = 0, n = 0;
-    for (int y = 1; y <= CHANNEL_H; y++) {
-        double ue = channelExactU(y), u = ux[idx(x, y)];
-        e += (u - ue) * (u - ue);
-        n += ue * ue;
-    }
-    return std::sqrt(e / n);
-}
-
-void step() {
-    const bool forced = FX != 0.0f || FY != 0.0f;  // unforced path stays exactly the plain BGK update
-
-    // 1-3: compute moments, then BGK collision (in place)
-    //   With a force (Guo et al. 2002): u = (sum f_i c_i + F/2) / rho, and after relaxing add
-    //   S_i = (1 - omega/2) w_i [3 (c_i - u).F + 9 (c_i.u)(c_i.F)]. Keeps the scheme second order.
-#pragma omp parallel for
-    for (int y = 0; y < NY; y++)
-        for (int x = 0; x < NX; x++) {
-            if (solid[idx(x, y)]) continue;
-            float r = 0, mx = 0, my = 0;
-            for (int i = 0; i < 9; i++) {
-                float fi = f[fidx(i, x, y)];
-                r += fi;
-                mx += fi * cx[i];
-                my += fi * cy[i];
-            }
-            float u = mx / r, v = my / r;
-            if (forced) { u += 0.5f * FX / r; v += 0.5f * FY / r; }
-            rho[idx(x, y)] = r; ux[idx(x, y)] = u; uy[idx(x, y)] = v;
-            for (int i = 0; i < 9; i++) {
-                float& fi = f[fidx(i, x, y)];
-                fi += OMEGA * (feq(i, r, u, v) - fi);
-                if (forced) {
-                    float cF = cx[i] * FX + cy[i] * FY, cu = cx[i] * u + cy[i] * v;
-                    fi += (1.0f - 0.5f * OMEGA) * w[i] * (3.0f * (cF - u * FX - v * FY) + 9.0f * cu * cF);
-                }
-            }
-        }
-
-    // 4: streaming ("pull": each node grabs what arrives from x - c_i).
-    //    If the source is a wall, the population that left toward the wall
-    //    bounces back: f_i(x) = f_opp(i)(x)  -> no-slip wall (halfway bounce-back).
-    //    Top/bottom are periodic; left/right too if PERIODIC_X.
-#pragma omp parallel for
-    for (int y = 0; y < NY; y++)
-        for (int x = 0; x < NX; x++) {
-            if (solid[idx(x, y)]) continue;
-            for (int i = 0; i < 9; i++) {
-                int xs = x - cx[i];
-                if (PERIODIC_X) xs = (xs + NX) % NX;
-                int ys = (y - cy[i] + NY) % NY;
-                if (xs < 0 || xs >= NX)        f2[fidx(i, x, y)] = f[fidx(i, x, y)];  // fixed by BCs below
-                else if (solid[idx(xs, ys)])   f2[fidx(i, x, y)] = f[fidx(opp[i], x, y)];
-                else                           f2[fidx(i, x, y)] = f[fidx(i, xs, ys)];
-            }
-        }
-
-    // boundaries: inlet = equilibrium at (rho=1, u=U0); outlet = zero-gradient copy
-    if (!PERIODIC_X)
-    for (int y = 0; y < NY; y++)
-        for (int i = 0; i < 9; i++) {
-            f2[fidx(i, 0, y)] = feq(i, 1.0f, U0, 0.0f);
-            f2[fidx(i, NX - 1, y)] = f2[fidx(i, NX - 2, y)];
-        }
-
-    f.swap(f2);
-}
 
 // ---------------- rendering ----------------
 uint32_t pixels[NX * NY];
@@ -640,9 +519,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int main() {
+    reset();
     std::printf("D2Q9 LBM  %dx%d  Re=%.0f  U0=%.3f  nu=%.4f  tau=%.4f\n", NX, NY, RE, U0, NU, TAU);
     if (TAU < 0.51f) std::printf("WARNING: tau too close to 0.5, will likely blow up. Lower Re or raise resolution.\n");
-    reset();
 
     WNDCLASSA wc = {};
     wc.lpfnWndProc = WndProc;
