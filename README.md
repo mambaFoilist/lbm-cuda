@@ -6,8 +6,10 @@ This serves as an entertainment of my interests in statistical mechanics, comput
 
 ## Curent Status
 - CPU Solver
-- Drawing Method to represent a test run (It is basic )
-- A stable looking test run on cylinder (Need to validate tho)
+- Drawing Method to represent a test run
+- A stable looking test run on cylinder
+
+![Bluff cylinder developing a Von Karman Street](image-1.png)
 
 ## Next Steps
 - Validate what I am currently getting against:
@@ -30,3 +32,7 @@ Given how difficult NS can be, we look for simple analytic solutions to verify t
 [Brian Storey's Video](https://www.youtube.com/watch?v=zsp6ZNB62mc)
 
 For a similar setup, we expect to get back a parabolic velocity profile. That is precisely what check_poiseuille.cpp does. It required an extra forcing term to replicate the -dp/dx (i.e. the constant pressure gradient in the direction of the pipe) but it does replicate it pretty faithfully.
+
+For my viewer, I added the option to visually watch the flow converge to what we expect.
+
+![Screenshot of Poiseuille Flow Validation](image.png)

@@ -1,9 +1,11 @@
 // lbm.cpp — D2Q9 lattice Boltzmann (BGK), flow past a cylinder, live Win32 window.
 //
 // Build:  g++ -O3 -march=native -fopenmp src/lbm_viewer.cpp -o lbm_viewer.exe -lgdi32
-// Keys:   Space = pause   V = vorticity/speed view   R = reset   C = cylinder/channel case
+// zKeys:   Space = pause   V = vorticity/speed view   R = reset   C = cylinder/channel case
 //         K = velocity rake on/off   A = exact Poiseuille profile on the rake (channel case)
+//         S = streamlines on/off     X = clear streamline seeds (back to auto seeds at the inlet)
 // Mouse:  left-drag = draw wall   right-drag = erase wall   shift+left-drag = place rake
+//         ctrl+click = add streamline seed
 //
 // Units are lattice units: dx = dt = 1, c_s^2 = 1/3.
 // Everything below maps to 4 equations:
@@ -66,12 +68,12 @@ bool inShape(int x, int y) {
     float dx = x - CYL_X, dy = y - CYL_Y;
 
     // Circle
-    //return dx*dx + dy*dy <= CYL_R*CYL_R;
+    return dx*dx + dy*dy <= CYL_R*CYL_R;
 
     // Square:      return std::abs(dx) <= CYL_R && std::abs(dy) <= CYL_R;
     // Ellipse:     return (dx*dx)/(2.0f*CYL_R*CYL_R) + (dy*dy)/(0.5f*CYL_R*CYL_R) <= 1.0f;
     //Flat plate:  
-    return std::abs(dx) <= 1 && std::abs(dy) <= CYL_R;
+    //return std::abs(dx) <= 1 && std::abs(dy) <= CYL_R;
 }
 
 void setupChannel(int H, float umax);
@@ -317,6 +319,92 @@ void drawRake(HDC dc) {
     SelectObject(dc, old);
 }
 
+// ---------------- streamlines ----------------
+// Curves tangent to the current u field: dx/ds = u/|u|. Following the unit tangent (not u itself)
+// gives evenly spaced points whatever the speed, so slow regions don't stall the integration.
+// Midpoint RK2 on the bilinear field from sampleU; each seed is traced forward and backward.
+// These are instantaneous streamlines: in unsteady flow they are not the paths particles follow.
+// Cost: GDI drawing is ~0.1 us per point, so a point is only kept when the line has turned > ~2.6 deg
+// (or every 16 cells): chord error < 0.1 cell, and straight lines shrink ~16x. Lines are retraced
+// every few frames only; shedding takes ~55 frames per period, so that's not visible.
+bool showStreamlines = false;
+std::vector<float> seedX, seedY;     // user seeds (ctrl+click); none -> auto seeds along the inlet
+constexpr int AUTO_SEEDS = 24;
+constexpr int MAX_SEEDS = 16;
+constexpr int MAX_LINES = AUTO_SEEDS > 2 * MAX_SEEDS ? AUTO_SEEDS : 2 * MAX_SEEDS;
+constexpr float STREAM_H = 2.0f;     // integration step along the line, lattice cells
+constexpr int STREAM_STEPS = NX;     // max steps each way (2 domain lengths)
+constexpr int RETRACE_EVERY = 4;     // frames between retraces
+int streamAge = RETRACE_EVERY;       // set to RETRACE_EVERY to force a retrace on the next frame
+
+// Traces n lines from (sx, sy), direction dir = +1 along u or -1 against it.
+// All lines advance one step per pass: one line alone is a chain of dependent loads, sqrts and
+// divides (~0.1 us per step), but steps of different lines are independent and the CPU overlaps them.
+// (Threads don't pay off here: starting an OpenMP region costs about as much as the whole trace.)
+void traceLines(int n, const float* sx, const float* sy, const float* dir, Runs& out) {
+    static std::vector<POINT> pts[MAX_LINES];
+    float x[MAX_LINES], y[MAX_LINES], ex[MAX_LINES], ey[MAX_LINES];  // e: direction at the last kept point
+    int since[MAX_LINES];                                             // steps since the last kept point
+    bool alive[MAX_LINES];
+    for (int l = 0; l < n; l++) {
+        x[l] = sx[l]; y[l] = sy[l]; ex[l] = ey[l] = 0; since[l] = 0; alive[l] = true;
+        pts[l].assign(1, toScreen(x[l], y[l]));
+    }
+    auto advance = [&](int l, int k) {  // one RK2 step of line l; false = line ends here
+        float u, v, s, d = dir[l];
+        sampleU(x[l], y[l], u, v);
+        if ((s = std::sqrt(u * u + v * v)) < 1e-6f) return false;  // stagnation point
+        float xm = x[l] + 0.5f * STREAM_H * d * u / s, ym = y[l] + 0.5f * STREAM_H * d * v / s;
+        sampleU(xm, ym, u, v);
+        if ((s = std::sqrt(u * u + v * v)) < 1e-6f) return false;
+        float tx = d * u / s, ty = d * v / s, nx = x[l] + STREAM_H * tx, ny = y[l] + STREAM_H * ty;
+        if (nx < 0 || nx > NX - 1 || ny < 0 || ny > NY - 1) return false;
+        if (solid[idx((int)(nx + 0.5f), (int)(ny + 0.5f))]) return false;
+        x[l] = nx; y[l] = ny; since[l]++;
+        if (k == 0) { ex[l] = tx; ey[l] = ty; }
+        if (since[l] >= 16 || ex[l] * tx + ey[l] * ty < 0.999f) {
+            pts[l].push_back(toScreen(nx, ny));
+            ex[l] = tx; ey[l] = ty; since[l] = 0;
+        }
+        float r2 = (nx - sx[l]) * (nx - sx[l]) + (ny - sy[l]) * (ny - sy[l]);
+        return !(k > 8 && r2 < 0.36f * STREAM_H * STREAM_H);  // back at the seed: closed loop (steady eddy)
+    };
+    for (int k = 0, live = n; k < STREAM_STEPS && live > 0; k++)
+        for (int l = 0; l < n; l++)
+            if (alive[l] && !advance(l, k)) { alive[l] = false; live--; }
+    for (int l = 0; l < n; l++) {
+        if (since[l]) pts[l].push_back(toScreen(x[l], y[l]));
+        for (POINT p : pts[l]) out.add(p);
+        out.cut();
+    }
+}
+
+void drawStreamlines(HDC dc) {
+    static HPEN linePen = CreatePen(PS_SOLID, 1, RGB(40, 40, 40));
+    static HPEN seedPen = CreatePen(PS_SOLID, 2, RGB(200, 0, 200));
+    static Runs lines, marks;
+    if (++streamAge >= RETRACE_EVERY) {
+        streamAge = 0;
+        lines.clear(); marks.clear();
+        float sx[MAX_LINES], sy[MAX_LINES], dir[MAX_LINES];
+        int n = 0;
+        if (seedX.empty())
+            for (int k = 0; k < AUTO_SEEDS; k++, n++) { sx[n] = 1.0f; sy[n] = (k + 0.5f) * NY / AUTO_SEEDS - 0.5f; dir[n] = 1.0f; }
+        for (size_t k = 0; k < seedX.size(); k++) {
+            for (float d : {1.0f, -1.0f}) { sx[n] = seedX[k]; sy[n] = seedY[k]; dir[n++] = d; }
+            POINT p = toScreen(seedX[k], seedY[k]);  // small cross on each seed
+            marks.add({p.x - 3, p.y - 3}); marks.add({p.x + 3, p.y + 3}); marks.cut();
+            marks.add({p.x - 3, p.y + 3}); marks.add({p.x + 3, p.y - 3}); marks.cut();
+        }
+        traceLines(n, sx, sy, dir, lines);
+    }
+    HGDIOBJ old = SelectObject(dc, linePen);
+    lines.draw(dc);
+    SelectObject(dc, seedPen);
+    marks.draw(dc);
+    SelectObject(dc, old);
+}
+
 // ---------------- window / input ----------------
 void paint(HWND hwnd) {
     BITMAPINFO bmi = {};
@@ -328,7 +416,9 @@ void paint(HWND hwnd) {
     bmi.bmiHeader.biCompression = BI_RGB;
     HDC dc = GetDC(hwnd);
     StretchDIBits(dc, 0, 0, NX * SCALE, NY * SCALE, 0, 0, NX, NY, pixels, &bmi, DIB_RGB_COLORS, SRCCOPY);
-    if (showRake) drawRake(dc);  // straight on top: ~0.1 ms, vs ~0.6 ms for a back buffer every frame
+    // overlays go straight on top: ~0.1 ms, vs ~0.6 ms for a back buffer every frame
+    if (showStreamlines) drawStreamlines(dc);
+    if (showRake) drawRake(dc);
     ReleaseDC(hwnd, dc);
 }
 
@@ -352,16 +442,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (wp == VK_SPACE) paused = !paused;
         if (wp == 'V') showVorticity = !showVorticity;
-        if (wp == 'R') reset();
+        if (wp == 'R') { reset(); streamAge = RETRACE_EVERY; }
         if (wp == 'C') {
             channelCase = !channelCase;
             reset();
+            streamAge = RETRACE_EVERY;
             std::printf("%s  nu=%.4f  tau=%.4f\n", channelCase ? "Poiseuille channel" : "cylinder", NU, TAU);
         }
         if (wp == 'K') showRake = !showRake;
         if (wp == 'A') { showExact = !showExact; if (showExact) showRake = true; }
+        if (wp == 'S') { showStreamlines = !showStreamlines; streamAge = RETRACE_EVERY; }
+        if (wp == 'X') { seedX.clear(); seedY.clear(); streamAge = RETRACE_EVERY; }  // back to auto seeds
         return 0;
     case WM_LBUTTONDOWN:
+        if (wp & MK_CONTROL) {  // ctrl+click adds a streamline seed
+            if (seedX.size() < MAX_SEEDS) {
+                float x, y;
+                toLattice(lp, x, y);
+                seedX.push_back(x); seedY.push_back(y);
+            }
+            showStreamlines = true;
+            streamAge = RETRACE_EVERY;
+            return 0;
+        }
         if (wp & MK_SHIFT) {  // shift-drag places the rake
             toLattice(lp, rakeX0, rakeY0);
             rakeX1 = rakeX0; rakeY1 = rakeY0;
@@ -372,6 +475,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         [[fallthrough]];
     case WM_RBUTTONDOWN: case WM_MOUSEMOVE:
         if (rakeDragging) { toLattice(lp, rakeX1, rakeY1); return 0; }
+        if (wp & MK_CONTROL) return 0;  // moving after a ctrl+click shouldn't paint walls
         if (wp & MK_LBUTTON) brush(lp, true);
         else if (wp & MK_RBUTTON) brush(lp, false);
         return 0;
