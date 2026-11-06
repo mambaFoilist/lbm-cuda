@@ -60,8 +60,10 @@ D = 40 cells in a 1600 × 800 domain (5% blockage), U = 0.1. St comes from the l
 | 50 | 0.1292 | 0.1231 | +5.0% |
 | 75 | 0.1535 | 0.1492 | +2.9% |
 | 100 | 0.1683 | 0.1643 | +2.4% |
-| 125 | *pending* | 0.1750 | |
-| 150 | *pending* | 0.1838 | |
+| 125 | 0.1790 | 0.1750 | +2.3% |
+| 150 | 0.1871 | 0.1834 | +2.0% |
+
+Every point is a few percent high, by a similar amount. That fits the remaining 5% blockage and Ma = 0.17, both of which push St up.
 
 My earlier 400 × 100 domain (22% blockage) gave St = 0.20 at Re = 100, 23% high. Confinement matters.
 
@@ -73,11 +75,17 @@ C_D is the mean over 3 sub-cell positions of the cylinder centre. The reference 
 | 10 | 6.459 ± 0.068 | +15.8% |
 | 20 | 5.836 ± 0.036 | +4.6% |
 | 40 | 5.655 ± 0.009 | +1.35% |
-| 80 | *pending* | |
+| 80 | 5.612 ± 0.003 | +0.59% |
 
-- The observed order is ≈ 1.8, between the first order of a staircase and the scheme's second order.
+- The observed order is ≈ 1.8 from N = 10 to 40, better than the first order expected for a staircase. From 40 to 80 it
+  flattens to ≈ 1.2.
+- Richardson extrapolation of the last three N gives order ≈ 2.1 and C_D → 5.599, which is still 0.36% above the reference.
+  So a small error remains that grid refinement does not remove. The inlet/outlet treatment or the finite domain are the
+  first suspects (not yet tested).
+- For 1% drag accuracy with staircase bounce-back, you need ~50 cells per diameter.
 - The tiny lift is dominated by the staircase: shifting the centre by 0.2 cells makes the rasterised cylinder
-  lopsided and changes C_L by up to ~20×, while C_D moves only 1–2%.
+  lopsided and changes C_L by up to ~20× at N = 10, while C_D moves only 1–2%. By N = 80 every placement gives
+  1.0–1.8× the reference lift.
 
 ![C_D convergence](figures/fig6_schafer_turek_convergence.png)
 
@@ -127,7 +135,7 @@ The same command pattern builds `check_cylinder` and `check_schafer_turek`.
 ```
 .\sweep_poiseuille_tau.exe            # ~25 s
 .\run_schafer_turek.exe 10 20 40      # ~6 min
-.\run_schafer_turek.exe 80            # ~70 min (3 centre offsets)
+.\run_schafer_turek.exe 80            # 0.93 M steps per offset: ~15 min each at full speed, much longer if the laptop throttles
 .\run_strouhal.exe                    # ~30 min, double, Re 50-150
 python scripts/make_figures.py        # needs numpy + matplotlib
 ```
